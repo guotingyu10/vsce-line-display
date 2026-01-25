@@ -1,0 +1,36 @@
+{
+  "name": "vsce-line-display",
+  "displayName": "Line Display Shadow",
+  "description": "根据指令在编辑器中展示其他文件的第 m-n 行文本影子",
+  "version": "0.0.1",
+  "publisher": "local-dev",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "lineDisplay.toggle",
+        "title": "Toggle Line Display Shadow"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "echo \"No lint configured\""
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.10",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.6.3"
+  }
+}
