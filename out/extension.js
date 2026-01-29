@@ -47,6 +47,15 @@ function activate(context) {
         if (!editor)
             return;
         const doc = editor.document;
+        // Filter out irrelevant schemes (e.g. output, debug, git) to avoid unnecessary processing
+        if (doc.uri.scheme !== 'file' && doc.uri.scheme !== 'untitled') {
+            return;
+        }
+        // Performance safeguard: skip extremely large files (e.g. > 10MB or > 100k lines)
+        // to prevent blocking the extension host with regex matching.
+        if (doc.lineCount > 50000) {
+            return;
+        }
         const text = doc.getText();
         const lines = text.split(/\r?\n/);
         const oldSpecs = overlaysByEditor.get(editor) || [];
@@ -69,7 +78,8 @@ function activate(context) {
                 old.startLine === newSpec.startLine &&
                 old.endLine === newSpec.endLine &&
                 old.show === newSpec.show &&
-                old.opacity === newSpec.opacity);
+                old.opacity === newSpec.opacity &&
+                old.indent === newSpec.indent);
             if (matchIndex !== -1) {
                 // Found a match: reuse the decoration type and cached lines
                 const reused = availableOldSpecs[matchIndex];
@@ -124,6 +134,27 @@ function activate(context) {
         tryScan(editor ?? vscode.window.activeTextEditor);
     });
     disposables.push(activeHandler);
+    const visibleHandler = vscode.window.onDidChangeVisibleTextEditors((visibleEditors) => {
+        // 1. Clean up invisible editors
+        const visibleSet = new Set(visibleEditors);
+        for (const [editor, specs] of overlaysByEditor.entries()) {
+            if (!visibleSet.has(editor)) {
+                // Dispose decorations to free resources
+                for (const spec of specs) {
+                    spec.decorationType?.dispose();
+                }
+                // Remove from map to prevent memory leak
+                overlaysByEditor.delete(editor);
+            }
+        }
+        // 2. Scan newly visible editors
+        for (const editor of visibleEditors) {
+            if (!overlaysByEditor.has(editor)) {
+                tryScan(editor);
+            }
+        }
+    });
+    disposables.push(visibleHandler);
     const toggleCmd = vscode.commands.registerCommand('lineDisplay.toggle', () => {
         const editor = vscode.window.activeTextEditor;
         if (!editor)
@@ -163,7 +194,7 @@ function createSpecFromMatch(match, editor, lineIndex) {
     const startLine = parseInt(match[2], 10);
     const endLine = parseInt(match[3], 10);
     const paramsRaw = match[4] ?? '';
-    const { show, opacity } = parseParams(paramsRaw);
+    const { show, opacity, indent } = parseParams(paramsRaw);
     const targetUri = resolveTargetUri(editor.document.uri, path);
     if (!targetUri)
         return null;
@@ -174,6 +205,7 @@ function createSpecFromMatch(match, editor, lineIndex) {
         endLine,
         show,
         opacity,
+        indent,
         decorationType: null,
         lines: []
     };
@@ -184,19 +216,24 @@ function clamp01(v) {
 function parseParams(raw) {
     let show = false;
     let opacity = 0.4;
+    let indent = 0;
     const s = raw.trim();
     if (!s)
-        return { show, opacity };
+        return { show, opacity, indent };
+    // Float parsing mode (e.g. "1; 0.5") - limited support for '3' indentation unless explicitly handled
+    // For now, we assume users using '3' for indentation will use the compact integer format (e.g. "13320")
     if (s.includes('.')) {
         const f = parseFloat(s);
         if (!isNaN(f))
             opacity = clamp01(f);
         show = s.trim().startsWith('1');
-        return { show, opacity };
+        return { show, opacity, indent };
     }
+    // Integer parsing mode
     let digits = s.replace(/\D+/g, '');
     if (!digits)
-        return { show, opacity };
+        return { show, opacity, indent };
+    // 1. Check Show (first digit '1')
     if (digits[0] === '1') {
         show = true;
         digits = digits.slice(1);
@@ -205,7 +242,27 @@ function parseParams(raw) {
         show = false;
     }
     if (!digits)
-        return { show, opacity };
+        return { show, opacity, indent };
+    // 2. Extract Indent ('3')
+    // We count '3's and remove them from the string used for opacity
+    let indentCount = 0;
+    let cleanDigits = '';
+    for (const char of digits) {
+        if (char === '3') {
+            indentCount++;
+        }
+        else {
+            cleanDigits += char;
+        }
+    }
+    indent = indentCount;
+    digits = cleanDigits;
+    // 3. Parse Opacity (remaining digits)
+    if (!digits) {
+        // If only '3's were present (e.g. "133"), we default opacity to 0.4
+        // If user explicitly wants 0 opacity, they should provide '0' (e.g. "1330")
+        return { show, opacity, indent };
+    }
     const n = parseInt(digits, 10);
     if (!isNaN(n)) {
         if (n > 1 && n <= 100)
@@ -213,18 +270,15 @@ function parseParams(raw) {
         else
             opacity = clamp01(n);
     }
-    return { show, opacity };
+    return { show, opacity, indent };
 }
 function resolveTargetUri(base, rawPath) {
-    const wsFolders = vscode.workspace.workspaceFolders;
     const isAbsolute = /^(?:[a-zA-Z]:\\|\/)/.test(rawPath);
     if (isAbsolute)
         return vscode.Uri.file(rawPath);
-    if (wsFolders && wsFolders.length > 0) {
-        return vscode.Uri.joinPath(wsFolders[0].uri, rawPath);
-    }
-    const dir = vscode.Uri.file(base.fsPath.replace(/[\\\/][^\\\/]+$/, ''));
-    return vscode.Uri.joinPath(dir, rawPath);
+    // Always resolve relative to the current document's directory
+    // This supports standard relative paths like "./foo.txt", "../foo.txt" or just "foo.txt"
+    return vscode.Uri.joinPath(base, '..', rawPath);
 }
 async function loadOverlayLines(spec) {
     try {
@@ -237,7 +291,8 @@ async function loadOverlayLines(spec) {
         }
         spec.lines = lines;
     }
-    catch {
+    catch (error) {
+        console.error(`[LineDisplay] Failed to load overlay lines for ${spec.targetUri.toString()}:`, error);
         spec.lines = [];
     }
 }
@@ -270,6 +325,7 @@ function renderOverlay(editor, spec) {
       position: absolute;
       top: ${topOffset}em;
       left: 0;
+      padding-left: ${spec.indent}ch;
       width: 100%;
       pointer-events: none;
       opacity: ${spec.opacity};
